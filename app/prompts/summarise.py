@@ -1,3 +1,5 @@
+# System instructions for the Day 1 summarise exercise: one sentence, plain
+# text, and no invented facts or advice.
 SUMMARISE_SYSTEM_PROMPT = """
 You are the summarisation component of a customer-support backend.
 

@@ -1,6 +1,8 @@
 from datetime import datetime
 from enum import Enum
+
 from pydantic import Field
+
 from app.schemas.common import StrictModel
 
 
@@ -16,23 +18,14 @@ class OrderStatus(str, Enum):
 
 # Only expose item fields needed for support responses.
 class OrderItem(StrictModel):
-    sku: str = Field(
-        min_length=1,
-        max_length=50,
-    )
-    name: str = Field(
-        min_length=1,
-        max_length=200,
-    )
+    sku: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=200)
     quantity: int = Field(ge=1)
 
 
 # This is the trusted subset of an order that may be passed to Claude.
 class OrderContext(StrictModel):
-    order_id: str = Field(
-        min_length=3,
-        max_length=50,
-    )
+    order_id: str = Field(min_length=3, max_length=50)
     status: OrderStatus
     items: list[OrderItem]
     estimated_delivery: datetime | None = None

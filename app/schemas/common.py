@@ -1,15 +1,20 @@
 from enum import Enum
 from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
 
 
 class StrictModel(BaseModel):
+    # Base model for application-facing data contracts.
+
+    # extra="forbid" rejects unknown fields; str_strip_whitespace trims spaces around text.
     model_config = ConfigDict(
         extra="forbid",
         str_strip_whitespace=True,
     )
 
 
+# Enums limit a field to a fixed set of values, so Pydantic rejects anything else.
 class TicketCategory(str, Enum):
     DELIVERY = "delivery"
     RETURN = "return"
@@ -34,9 +39,7 @@ class Priority(str, Enum):
     URGENT = "urgent"
 
 
-class HealthResponse(StrictModel):
-    status: Literal["ok"]
-
+# Workflow state of a ticket. Set by the application, never by Claude.
 class TicketStatus(str, Enum):
     NEW = "new"
     ANALYSED = "analysed"
@@ -45,3 +48,8 @@ class TicketStatus(str, Enum):
     ESCALATED = "escalated"
     PROCESSING_FAILED = "processing_failed"
     CLOSED = "closed"
+
+
+# Response shape for GET /health.
+class HealthResponse(StrictModel):
+    status: Literal["ok"]

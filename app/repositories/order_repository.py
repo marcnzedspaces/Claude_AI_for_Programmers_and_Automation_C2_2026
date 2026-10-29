@@ -15,10 +15,7 @@ ORDER_CONTEXT_PROJECTION = {
 
 
 class OrderRepository:
-    def __init__(
-        self,
-        database: Any,
-    ) -> None:
+    def __init__(self, database: Any) -> None:
         # Repositories own database access; ClaudeService does not.
         self.collection = database.orders
 

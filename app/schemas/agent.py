@@ -10,13 +10,9 @@ from app.schemas.usage import AIUsage
 
 # Only names in this enum are capabilities the application knows about.
 class ToolName(str, Enum):
-    GET_ORDER_STATUS = (
-        "get_order_status"
-    )
+    GET_ORDER_STATUS = "get_order_status"
     SEARCH_FAQ = "search_faq"
-    ESCALATE_TICKET = (
-        "escalate_ticket"
-    )
+    ESCALATE_TICKET = "escalate_ticket"
 
 
 # Argument models, one per tool. ToolRegistry turns each into the JSON schema
@@ -70,10 +66,7 @@ class AgentSupportRequest(StrictModel):
 class ToolExecutionAudit(StrictModel):
     # Record what the model requested and what the application actually did.
     tool_name: str
-    arguments: dict[
-        str,
-        Any,
-    ] = Field(default_factory=dict)
+    arguments: dict[str, Any] = Field(default_factory=dict)
     success: bool
     result_summary: str = Field(
         min_length=1,
@@ -90,10 +83,9 @@ class AgentSupportResponse(StrictModel):
         min_length=1,
         max_length=5000,
     )
-    tool_calls: list[
-        ToolExecutionAudit
-    ] = Field(default_factory=list)
-
+    tool_calls: list[ToolExecutionAudit] = Field(
+        default_factory=list,
+    )
     # Bound the visible iteration count to the intended small teaching loop.
     iterations: int = Field(
         ge=1,

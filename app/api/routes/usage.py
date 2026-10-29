@@ -2,14 +2,18 @@ from fastapi import APIRouter, Query
 
 from app.database import get_database
 from app.repositories.usage_repository import UsageRepository
-from app.schemas.usage import AIOperation, UsageResponse
+from app.schemas.usage import (
+    AIOperation,
+    UsageResponse,
+)
 from app.services.usage_service import UsageService
+
 
 # Routes only accept the request and shape the response. UsageService and the
 # repository do the work.
 router = APIRouter(
     prefix="/usage",
-    tags=["usage"]
+    tags=["usage"],
 )
 
 
@@ -19,6 +23,8 @@ router = APIRouter(
     "",
     response_model=UsageResponse,
 )
+# FastAPI checks each query parameter from the URL (type, length, range) before this function runs.
+# Invalid values get a 422 reply automatically.
 async def get_usage(
     operation: AIOperation | None = Query(
         default=None,
@@ -48,10 +54,12 @@ async def get_usage(
         ge=0,
     ),
 ) -> UsageResponse:
+    # Build the service for this request. Flow: route -> service -> repository -> database.
     service = UsageService(
         UsageRepository(get_database())
     )
 
+    # The route only passes the validated values on; the service decides what to do with them.
     return await service.query(
         operation=operation,
         model=model,

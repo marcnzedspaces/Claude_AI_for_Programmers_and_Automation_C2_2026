@@ -1,10 +1,13 @@
 from dataclasses import dataclass
+from time import perf_counter
+
+from app.repositories.faq_repository import FAQRepository
 from app.repositories.order_repository import OrderRepository
 from app.schemas.ai import GenerateResponseRequest
 from app.services.response_service import ResponseService
-from app.repositories.faq_repository import FAQRepository
 
 
+# The drafted reply plus the metadata the API layer needs.
 @dataclass(frozen=True)
 class GenerateResponseResult:
     # Return both the draft and metadata needed by the API layer.
@@ -14,8 +17,11 @@ class GenerateResponseResult:
     model: str
     input_tokens: int
     output_tokens: int
+    latency_ms: int
 
 
+# Use-case logic for drafting a reply: look up trusted order and FAQ data,
+# then ask ResponseService to draft from it.
 class GenerateResponseService:
     def __init__(
         self,
@@ -49,6 +55,8 @@ class GenerateResponseService:
             request.faq_ids
         )
 
+        started = perf_counter()
+
         # Supply both kinds of retrieved context to the drafting service.
         claude_result = await self.response_service.generate_draft(
             request.customer_message,
@@ -56,8 +64,14 @@ class GenerateResponseService:
             faq_context=faq_context,
         )
 
+        # Latency covers the Claude call only, not the database lookups above.
+        latency_ms = int(
+            (perf_counter() - started) * 1000
+        )
+
         return GenerateResponseResult(
             draft_response=claude_result.text,
+            # Report which context was used, so callers can see what the draft was based on.
             order_id_used=(
                 order_context.order_id
                 if order_context
@@ -70,4 +84,5 @@ class GenerateResponseService:
             model=claude_result.model,
             input_tokens=claude_result.input_tokens,
             output_tokens=claude_result.output_tokens,
+            latency_ms=latency_ms,
         )

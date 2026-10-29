@@ -16,6 +16,8 @@ from app.schemas.usage import (
 )
 
 
+# Use-case logic for AI usage tracking: build usage logs, price them, save them and report on them.
+# Routes and other services call this class; only the repository touches MongoDB.
 class UsageService:
     def __init__(
         self,
@@ -24,6 +26,8 @@ class UsageService:
         self.repository = repository
         self.settings = get_settings()
 
+    # Cost = tokens / 1 million * price per million tokens, worked out for input and output separately.
+    # Prices come from settings (.env), not code, so they can change without editing code.
     def estimate_cost_usd(
         self,
         usage: AIUsage,
@@ -39,11 +43,13 @@ class UsageService:
             * self.settings.claude_output_cost_per_million_usd
         )
 
+        # Round to 8 decimals to avoid long floating-point tails.
         return round(
             input_cost + output_cost,
             8,
         )
 
+    # Builds and saves one usage log. The * makes the parameters keyword-only, so calls are easy to read.
     async def record(
         self,
         *,
@@ -52,6 +58,8 @@ class UsageService:
         usage: AIUsage,
         ticket_id: str | None = None,
     ) -> AIUsageLog:
+        # The application decides the IDs, totals, cost and timestamp.
+        # Only the model name and token counts originate from Claude's response.
         record = AIUsageLog(
             usage_id=new_usage_id(),
             request_id=request_id,
@@ -68,6 +76,7 @@ class UsageService:
             estimated_cost_usd=(
                 self.estimate_cost_usd(usage)
             ),
+            # Store time in UTC to avoid time-zone confusion.
             created_at=datetime.now(timezone.utc),
         )
 
@@ -89,6 +98,8 @@ class UsageService:
 
         return inserted
 
+    # Same as record(), but a database failure is logged instead of raised.
+    # Use it when tracking usage must never break the user's request (the Claude call already succeeded).
     async def safe_record(
         self,
         *,
@@ -104,7 +115,9 @@ class UsageService:
                 usage=usage,
                 ticket_id=ticket_id,
             )
+        # Only database errors are swallowed; any other error is a real bug and should still surface.
         except PyMongoError:
+            # Also write a log line, so usage shows up in the application logs.
             log_event(
                 "ai_usage_persist_failed",
                 level=logging.WARNING,
@@ -114,6 +127,7 @@ class UsageService:
             )
             return None
 
+    # Used by GET /usage: one page of logs plus a summary of all matching logs.
     async def query(
         self,
         *,
@@ -133,6 +147,7 @@ class UsageService:
             skip=skip,
         )
 
+        # Same filters as above, so the summary describes the same set of logs (not only this page).
         summary_data = await self.repository.summarize(
             operation=operation,
             model=model,
@@ -140,6 +155,7 @@ class UsageService:
             ticket_id=ticket_id,
         )
 
+        # Turn the repository's plain numbers into the validated UsageSummary.
         return UsageResponse(
             summary=UsageSummary(
                 total_calls=int(

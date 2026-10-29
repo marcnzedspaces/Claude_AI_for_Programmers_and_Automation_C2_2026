@@ -1,12 +1,10 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from time import perf_counter
 
 from app.repositories.faq_repository import FAQRepository
 from app.repositories.order_repository import OrderRepository
-from app.schemas.common import (
-    Priority,
-    TicketStatus,
-)
+from app.schemas.common import Priority, TicketStatus
 from app.schemas.ticket import (
     TicketCreateRequest,
     TicketResponse,
@@ -21,20 +19,14 @@ from app.services.response_service import ResponseService
 from app.services.ticket_service import TicketService
 
 
-# route -> WorkflowService -> analyse -> (order lookup) -> (FAQ lookup)
-#       -> create ticket -> generate draft -> update ticket
-# A deterministic workflow: Python code fixes the order of the steps and makes
-# every business decision. Claude is only called for two jobs (analysing the
-# message and drafting the reply) and never decides what happens next.
-
 # What the workflow hands back to the route. Immutable (frozen) so the result
 # cannot be changed by accident after the workflow has finished.
 @dataclass(frozen=True)
 class WorkflowProcessResult:
-    ticket: TicketResponse                # The final ticket as saved in MongoDB
-    executed_steps: list[WorkflowStep]    # Which steps really ran, in order
-    analysis_usage: AIUsage               # Tokens used by the analysis call
-    response_usage: AIUsage               # Tokens used by the draft call
+    ticket: TicketResponse
+    executed_steps: list[WorkflowStep]
+    analysis_usage: AIUsage
+    response_usage: AIUsage
 
 
 # Orchestrates existing services and repositories into one use case. It
@@ -66,16 +58,17 @@ class WorkflowService:
         # skipped step (for example no order lookup) is visible to the caller.
         steps: list[WorkflowStep] = []
 
-        # Step 1: Claude classifies/analyses the user message.
-        analysis_result = (
-            await self.analysis_service
-            .analyse(request.message)
+        analysis_started = perf_counter()
+        analysis_result = await self.analysis_service.analyse(
+            request.message
+        )
+        analysis_latency_ms = int(
+            (perf_counter() - analysis_started) * 1000
         )
         steps.append(WorkflowStep.ANALYSIS)
 
         # .data is the TicketAnalysis, already validated by Pydantic.
         analysis = analysis_result.data
-
         # Trusted context starts empty and is filled only by real lookups.
         order_context = None
         faq_context = []
@@ -84,8 +77,7 @@ class WorkflowService:
         # for a review, but an urgent ticket always gets one regardless.
         requires_human_review = (
             analysis.needs_human_review
-            or analysis.priority
-            == Priority.URGENT
+            or analysis.priority == Priority.URGENT
         )
 
         # Step 2a: retrieve order data only when analysis says it is needed.
@@ -95,8 +87,7 @@ class WorkflowService:
                 # customer can never read someone else's order. It returns
                 # None when no authorised order matches.
                 order_context = (
-                    await self.order_repository
-                    .get_order_for_customer(
+                    await self.order_repository.get_order_for_customer(
                         request.customer_id,
                         request.order_id,
                     )
@@ -109,15 +100,9 @@ class WorkflowService:
 
         # Step 2b: retrieve approved FAQ evidence when needed.
         if analysis.needs_faq_lookup:
-            # Search with Claude's suggested query, or fall back to the raw
-            # message. limit=3 keeps the prompt (and the cost) small.
-            faq_context = (
-                await self.faq_repository
-                .search(
-                    analysis.faq_query
-                    or request.message,
-                    limit=3,
-                )
+            faq_context = await self.faq_repository.search(
+                analysis.faq_query or request.message,
+                limit=3,
             )
             steps.append(WorkflowStep.FAQ_LOOKUP)
 
@@ -125,32 +110,29 @@ class WorkflowService:
             if not faq_context:
                 requires_human_review = True
 
-        # Step 3: create/persist the ticket as application state.
-        # The ticket is saved before the draft is generated, so there is a
-        # record of the request even if the Claude call in step 4 fails.
-        ticket = (
-            await self.ticket_service
-            .create(
-                TicketCreateRequest(
-                    customer_id=request.customer_id,
-                    order_id=request.order_id,
-                    message=request.message,
-                ),
-                analysis,
-            )
+        ticket = await self.ticket_service.create(
+            TicketCreateRequest(
+                customer_id=request.customer_id,
+                order_id=request.order_id,
+                message=request.message,
+            ),
+            analysis,
         )
         steps.append(WorkflowStep.DATABASE_INSERT)
 
+        response_started = perf_counter()
         # Step 4: Claude drafts using only retrieved trusted context.
         # If order_context or faq_context is empty, the draft cannot cite
         # those facts, and requires_human_review is already True above.
         response_result = (
-            await self.response_service
-            .generate_draft(
+            await self.response_service.generate_draft(
                 request.message,
                 order_context=order_context,
                 faq_context=faq_context,
             )
+        )
+        response_latency_ms = int(
+            (perf_counter() - response_started) * 1000
         )
         steps.append(WorkflowStep.RESPONSE_GENERATION)
 
@@ -161,35 +143,19 @@ class WorkflowService:
             else TicketStatus.PROCESSED
         )
 
-        # Build a validated updated ticket containing enrichment and the draft.
-        # model_dump() copies the stored ticket into a dict, the new values
-        # replace the old ones, and model_validate() re-checks the result.
-        updated_ticket = (
-            TicketResponse.model_validate(
-                {
-                    **ticket.model_dump(
-                        mode="python"
-                    ),
-                    "order_context":
-                        order_context,
-                    "faq_context":
-                        faq_context,
-                    "draft_response":
-                        response_result.text,
-                    "status":
-                        final_status,
-                    "updated_at":
-                        datetime.now(
-                            timezone.utc
-                        ),
-                }
-            )
+        updated_ticket = TicketResponse.model_validate(
+            {
+                **ticket.model_dump(mode="python"),
+                "order_context": order_context,
+                "faq_context": faq_context,
+                "draft_response": response_result.text,
+                "status": final_status,
+                "updated_at": datetime.now(timezone.utc),
+            }
         )
 
-        # Step 6: persist the completed workflow state.
-        updated_ticket = (
-            await self.ticket_service
-            .save(updated_ticket)
+        updated_ticket = await self.ticket_service.save(
+            updated_ticket
         )
         steps.append(WorkflowStep.DATABASE_UPDATE)
 
@@ -201,10 +167,12 @@ class WorkflowService:
                 model=analysis_result.model,
                 input_tokens=analysis_result.input_tokens,
                 output_tokens=analysis_result.output_tokens,
+                latency_ms=analysis_latency_ms,
             ),
             response_usage=AIUsage(
                 model=response_result.model,
                 input_tokens=response_result.input_tokens,
                 output_tokens=response_result.output_tokens,
+                latency_ms=response_latency_ms,
             ),
         )

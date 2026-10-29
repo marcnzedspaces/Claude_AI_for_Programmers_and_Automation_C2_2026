@@ -28,6 +28,8 @@ from app.services.claude_service import (
 )
 
 
+# Every request gets an ID in request_id_middleware. Reuse it so logs, error bodies and headers all match.
+# The fallback only matters if the middleware did not run.
 def _request_id(request: Request) -> str:
     return getattr(
         request.state,
@@ -36,6 +38,8 @@ def _request_id(request: Request) -> str:
     )
 
 
+# One function builds every error reply, so all errors share the same JSON shape (ErrorResponse)
+# and are logged the same way.
 def _error_response(
     request: Request,
     *,
@@ -48,6 +52,7 @@ def _error_response(
     request_id = _request_id(request)
 
     response_headers = dict(headers or {})
+    # Clients can quote this ID when they report a problem.
     response_headers["X-Request-ID"] = request_id
 
     body = ErrorResponse(
@@ -61,6 +66,7 @@ def _error_response(
 
     log_event(
         "request_error",
+        # 5xx means our fault (ERROR); 4xx means the caller's request was wrong (WARNING).
         level=(
             logging.ERROR
             if status_code >= 500
@@ -78,14 +84,18 @@ def _error_response(
     )
 
 
+# Middleware wraps every request: it runs before the route (to create the request ID)
+# and after it (to log how long the request took).
 async def request_id_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     request_id = f"req_{uuid4().hex}"
+    # request.state holds data for this one request, so error handlers can read the ID later.
     request.state.request_id = request_id
     started = perf_counter()
 
+    # call_next runs the route (and any later middleware) and gives back its response.
     response = await call_next(request)
     latency_ms = int(
         (perf_counter() - started) * 1000
@@ -104,12 +114,15 @@ async def request_id_middleware(
     return response
 
 
+# 422: FastAPI/Pydantic rejected the request data (for example ?limit=500).
+# Each problem is turned into a ValidationIssue so the client knows which field to fix.
 async def validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
     details = [
         ValidationIssue(
+            # error["loc"] is a path such as ("query", "limit"); join it into "query.limit".
             location=".".join(
                 str(part)
                 for part in error.get("loc", ())
@@ -140,6 +153,8 @@ async def validation_exception_handler(
     )
 
 
+# Handles HTTPException, such as the 404 raised by a route.
+# The status code is mapped to a stable, machine-readable error code.
 async def http_exception_handler(
     request: Request,
     exc: StarletteHTTPException,
@@ -171,6 +186,8 @@ async def http_exception_handler(
     )
 
 
+# The claude_* handlers below turn Anthropic API failures into clean 5xx replies.
+# The raw exception text is never sent to the client because it could reveal internal details.
 async def claude_timeout_handler(
     request: Request,
     exc: APITimeoutError,
@@ -243,6 +260,7 @@ async def claude_configuration_handler(
     )
 
 
+# Any MongoDB failure becomes a 503; the client never sees driver details.
 async def database_exception_handler(
     request: Request,
     exc: PyMongoError,
@@ -255,6 +273,7 @@ async def database_exception_handler(
     )
 
 
+# Last resort for any bug we did not anticipate: a generic 500 with no internals.
 async def unexpected_exception_handler(
     request: Request,
     exc: Exception,
@@ -267,6 +286,8 @@ async def unexpected_exception_handler(
     )
 
 
+# Called once from main.py. FastAPI picks the handler that matches the exception's class,
+# so the specific handlers win over the generic Exception one.
 def register_exception_handlers(
     app: FastAPI,
 ) -> None:

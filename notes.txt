@@ -264,3 +264,9 @@ HTTP request (request_id)
      -> UsageRepository (ai_usage_logs)
      -> GET /usage (filter/summary)
 
+
+FAQService.ask(question)
+     -> FAQRepository.search(question, limit=3)
+     -> MongoDB text index
+     -> go through approved FAQSource records
+     -> Claude evaluates support (when sources are found)

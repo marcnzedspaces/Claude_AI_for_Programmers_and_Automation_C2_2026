@@ -1,53 +1,54 @@
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
+
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel, ValidationError
+
 from app.config import get_settings
-from typing import Any
-# route/service -> ClaudeService -> Anthropic SDK (anthropic.AsyncAnthropic)
-# Routes never talk to the Anthropic SDK directly. They call this service,
-# which keeps all Claude API access behind one clear boundary.
 
-# Claude -> structured response parsing -> TicketAnalysis -> Pydantic validation
 
+# Claude -> structured response parsing -> Pydantic validation -> application data
 class ClaudeConfigurationError(RuntimeError):
     # Raised when a required setting (API key, model) is missing or empty,
     # so callers can tell a setup problem apart from an API failure.
     pass
 
+
 class ClaudeResponseError(RuntimeError):
-    # Raised when the Claude API returns an error response, so callers can
-    # tell an API failure apart from a setup problem.
+    # Raised when Claude's reply is unusable (it did not match the expected
+    # schema, or it was empty), so callers can tell it apart from a setup problem.
     pass
 
 
+# Plain-text reply plus the usage numbers the application records.
 @dataclass(frozen=True)
 class ClaudeTextResult:
-    # Immutable (frozen) result object: callers get only the data they need,
-    # not the raw SDK response object.
-    text: str           # The generated text, with text blocks joined together
-    model: str          # The model that actually answered
-    input_tokens: int   # Tokens in the prompt (useful for cost tracking)
-    output_tokens: int  # Tokens in the response (useful for cost tracking)
+    text: str
+    model: str
+    input_tokens: int
+    output_tokens: int
 
-# Placeholder for "any Pydantic model class". It lets ClaudeStructuredResult
-# and generate_structured keep the exact type: pass TicketAnalysis in and
-# get a TicketAnalysis back (not a generic BaseModel).
-StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
 
+# Stands for "any Pydantic model", so generate_structured can return whichever
+# model the caller asks for while keeping type hints accurate.
+StructuredModel = TypeVar(
+    "StructuredModel",
+    bound=BaseModel,
+)
+
+
+# A reply already parsed and validated into a Pydantic model, plus usage numbers.
 @dataclass(frozen=True)
 class ClaudeStructuredResult(Generic[StructuredModel]):
-    # Same idea as ClaudeTextResult, but data is an already-validated
-    # Pydantic object instead of a plain string.
-    # Immutable (frozen) result object: callers get only the data they need,
-    # not the raw SDK response object.
-    data: StructuredModel   # The parsed structured data
-    model: str              # The model that actually answered
-    input_tokens: int       # Tokens in the prompt (useful for cost tracking)
-    output_tokens: int      # Tokens in the response (useful for cost tracking)
+    data: StructuredModel
+    model: str
+    input_tokens: int
+    output_tokens: int
 
 
 class ClaudeService:
+    # Low-level wrapper around the Anthropic Messages API.
+
     def __init__(self) -> None:
         # Read settings (loaded from environment / .env) once at construction.
         settings = get_settings()
@@ -58,14 +59,7 @@ class ClaudeService:
                 "ANTHROPIC_API_KEY is not configured."
             )
 
-        # The key is stored as a Pydantic SecretStr so it is hidden in logs
-        # and reprs; get_secret_value() reveals it only here, where it is used.
-        api_key = (
-            settings.anthropic_api_key
-            .get_secret_value()
-            .strip()
-        )
-
+        api_key = settings.anthropic_api_key.get_secret_value().strip()
         # A key that is only whitespace passes the None check above, so
         # guard against it separately.
         if not api_key:
@@ -79,7 +73,6 @@ class ClaudeService:
             )
 
         self.model = settings.claude_model
-
         # Async client so FastAPI's event loop is not blocked while waiting
         # for Claude. Timeout and retry behaviour come from settings.
         self.client = AsyncAnthropic(
@@ -95,12 +88,8 @@ class ClaudeService:
         max_tokens: int = 300,
         system: str | None = None,
     ) -> ClaudeTextResult:
-        # user_message is the untrusted user input; system (optional) holds
-        # the application's own instructions. They are sent in separate
-        # fields so user input cannot overwrite the app's instructions.
-        # max_tokens caps the response length (and therefore the cost).
-
-        # Build the request as a dict so optional fields can be added below.
+        # Ask Claude for free text. The request is a dict so the optional
+        # system prompt can be added below.
         request = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -112,15 +101,11 @@ class ClaudeService:
             ],
         }
 
-        # Only include "system" when one was given; the API does not want
-        # an empty or None value for it.
         if system:
             request["system"] = system
 
-        # Send the request to Claude and wait for the full response.
-        message = await self.client.messages.create(
-            **request
-        )
+        # One call to the Anthropic Messages API.
+        message = await self.client.messages.create(**request)
 
         # message.content is a list of blocks (text, tool use, etc.).
         # Keep only the text blocks, then join them into a single string.
@@ -129,7 +114,6 @@ class ClaudeService:
             for block in message.content
             if block.type == "text"
         ]
-
         text = "\n".join(text_parts).strip()
 
         # Return only the fields the rest of the app needs.
@@ -148,10 +132,6 @@ class ClaudeService:
         max_tokens: int = 500,
         system: str | None = None,
     ) -> ClaudeStructuredResult[StructuredModel]:
-        # Ask Claude for a reply and parse it into a Pydantic model.
-        # output_model is the Pydantic model class the reply must match.
-        # user_message / system / max_tokens work as in generate_text.
-
         # Same request shape as generate_text, plus output_format, which
         # tells the SDK which schema to request and parse the reply into.
         request = {
@@ -166,67 +146,59 @@ class ClaudeService:
             "output_format": output_model,
         }
 
+        # Add optional request fields only when the caller supplies them.
         if system:
             request["system"] = system
 
         try:
-            # messages.parse sends the request and validates the reply
-            # against output_model in one step.
-            message = await self.client.messages.parse(
-                **request
-            )
+            message = await self.client.messages.parse(**request)
         except ValidationError as exc:
-            # The reply did not match the schema: never treat it as valid
-            # application data. Re-raise as our own error type.
+            # The reply did not pass the schema: raise our own error type.
             raise ClaudeResponseError(
-                "Claude structured output failed application validation"
+                "Claude structured output failed application validation."
             ) from exc
 
         # parsed_output is None when nothing could be parsed (for example,
         # the response was cut off or refused), so check before using it.
         if message.parsed_output is None:
+            # The reply did not match the schema: never treat it as valid
+            # application data. Re-raise as our own error type.
             raise ClaudeResponseError(
-                "Claude returned no structured output"
+                "Claude returned no parsed structured output."
             )
 
-        # Return only the validated data plus the usage numbers.
-        return ClaudeStructuredResult[StructuredModel](
+        return ClaudeStructuredResult(
             data=message.parsed_output,
             model=message.model,
             input_tokens=message.usage.input_tokens,
             output_tokens=message.usage.output_tokens,
         )
 
+    # Lower-level call used by the agent loop: the caller passes the whole
+    # conversation (and the tools Claude may request) and gets the raw reply back.
     async def create_message(
         self,
         messages: list[dict[str, Any]],
         *,
         max_tokens: int = 600,
         system: str | None = None,
-        tools: list[
-            dict[str, Any]
-        ] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Any:
-        """Send a raw Messages API request so tool_use blocks remain available."""
         request: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_tokens,
             "messages": messages,
         }
 
-        # Add optional request fields only when the caller supplies them.
+        # Only include "system" when one was given; the API does not want
+        # an empty or None value for it.
         if system:
             request["system"] = system
 
         if tools:
             request["tools"] = tools
 
-        # Unlike generate_text/structured, return the raw SDK message.
-        return (
-            await self.client
-            .messages.create(**request)
-        )
-
+        return await self.client.messages.create(**request)
 
     async def close(self) -> None:
         # Releases the HTTP connections held by the client. Meant to be
